@@ -1,0 +1,326 @@
+name: 1 AWS EKS Cluster + Prefect Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      nodes:
+        description: Number of EKS nodes
+        required: true
+        default: '1'
+        type: string
+      instance-type:
+        description: EC2 instance type
+        required: true
+        default: 'm5.large'
+        type: string
+      image:
+        description: Prefect base image for your agent
+        required: true
+        default: 'prefecthq/prefect:2-python3.9'
+        type: string
+      s3_path:
+        description: S3 path in the format bucket/path
+        required: true
+        default: 'prefect-orion/prod'
+      prefect-version:
+        description: Prefect version for flows
+        required: true
+        default: '2.*'
+        type: string
+      aws-region:
+        description: AWS Region
+        required: true
+        default: 'us-east-1'
+        type: string
+env:
+  EKS_CLUSTER: prefect
+  NAMESPACE_ENV: prod
+  K8_SECRET_NAME: prefect-secrets
+  PREFECT_VERSION: ${{ github.event.inputs.prefect-version }}
+  AWS_DEFAULT_REGION: ${{ github.event.inputs.aws-region }}
+
+jobs:
+  ecr-repo: # used by flows only; the agent uses image provided as input above
+    name: Create ECR repository, build and push the image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Create new ECR repository using AWS CloudFormation
+        uses: aws-actions/aws-cloudformation-github-deploy@v1
+        with:
+          name: "${{ env.NAMESPACE_ENV }}-ecr"
+          template: infrastructure/ecr_repository.yml
+          parameter-overrides: "RepositoryName=${{ env.NAMESPACE_ENV }}"
+          no-fail-on-empty-changeset: "1"
+
+      - name: Flow deployment finished
+        run: echo "ECR repository created at $(date +'%Y-%m-%dT%H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$NAMESPACE_ENV:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$NAMESPACE_ENV:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$NAMESPACE_ENV:$IMAGE_TAG"
+
+      - name: Flow deployments finished
+        run: echo "ECR image ${{ steps.build-image.outputs.image }} built at $(date +'%Y-%m-%dT%H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+
+  blocks:
+    name: Create blocks
+    runs-on: ubuntu-latest
+    needs: ecr-repo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      - name: Python dependencies
+        run: |
+          pip install -U "prefect==$PREFECT_VERSION"
+          pip install s3fs
+
+      - name: Prefect Cloud login
+        run: |
+          prefect config set PREFECT_API_KEY=${{ secrets.PREFECT_API_KEY }} 
+          prefect config set PREFECT_API_URL=${{ secrets.PREFECT_API_URL }}
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Build S3 block
+        run: |
+          cat <<EOF > s3_block.py
+          from prefect.filesystems import S3
+          s3 = S3(bucket_path="${{ github.event.inputs.s3_path }}", aws_access_key_id="${{ secrets.AWS_ACCESS_KEY_ID }}", aws_secret_access_key="${{ secrets.AWS_SECRET_ACCESS_KEY }}")
+          s3.save("${{ env.NAMESPACE_ENV }}", overwrite=True)
+          EOF
+          python s3_block.py
+      - name: Build KubernetesJob block
+        run: |
+          cat <<EOF > k8s_block.py
+          from prefect.infrastructure import KubernetesJob
+          k8s = KubernetesJob(image="${{ needs.ecr-repo.outputs.image }}", namespace="${{ env.NAMESPACE_ENV }}", 
+          customizations=[{"op": "add", "path": "/spec/ttlSecondsAfterFinished", "value": 10}], image_pull_policy="IfNotPresent")
+          k8s.save("${{ env.NAMESPACE_ENV }}", overwrite=True)
+          EOF
+          python k8s_block.py
+      - name: Summary
+        run: echo 'Blocks created successfully! :duck:' >> $GITHUB_STEP_SUMMARY
+
+  list-flows:
+    runs-on: ubuntu-latest
+    needs: blocks
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - id: set-matrix
+        run: echo "::set-output name=matrix::$(ls flows/*.py | jq -R -s -c 'split("\n")[:-1]')"
+
+  deploy:
+    needs: list-flows
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flows: ${{ fromJson(needs.list-flows.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+
+      - name: Python dependencies
+        run: |
+          pip install -U "prefect==$PREFECT_VERSION"
+          pip install s3fs
+          pip install .
+
+      - name: Prefect Cloud login
+        run: |
+          prefect config set PREFECT_API_KEY=${{ secrets.PREFECT_API_KEY }} 
+          prefect config set PREFECT_API_URL=${{ secrets.PREFECT_API_URL }}
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Deploy flows to S3
+        id: build
+        run: |
+          FLOW_NAME=$(basename ${{ matrix.flows }} .py)
+          prefect deployment build ${{ matrix.flows }}:$FLOW_NAME --name ${{ env.NAMESPACE_ENV }} -q ${{ env.NAMESPACE_ENV }} \
+          -sb s3/${{ env.NAMESPACE_ENV }} -ib kubernetes-job/${{ env.NAMESPACE_ENV }} -a -v $GITHUB_SHA -o $FLOW_NAME.yaml
+          echo ::set-output name=flow_manifest::$FLOW_NAME.yaml
+
+      - name: Upload deployment manifest as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: Deployment YAML manifests
+          path: ${{ steps.build.outputs.flow_manifest }}
+
+  prefect-agent-eks:
+    name: EKS cluster & Prefect agent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Install eksctl
+        run: |
+          brew tap weaveworks/tap
+          brew install weaveworks/tap/eksctl
+          echo "ekctl istalled with version: $(eksctl version)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create AWS resources incl. EKS cluster
+        run: |
+          eksctl create cluster --dry-run -f - << 'EOF' > eks.yaml
+          ---
+          apiVersion: eksctl.io/v1alpha5
+          kind: ClusterConfig
+          
+          metadata:
+            name: ${{env.EKS_CLUSTER}}
+            region: ${{ env.AWS_DEFAULT_REGION }}
+          
+          iam:
+            withOIDC: true
+          
+          managedNodeGroups:
+            - name: prefect-ng-1
+              amiFamily: AmazonLinux2
+              instanceType: ${{github.event.inputs.instance-type}}
+              desiredCapacity: ${{github.event.inputs.nodes}}
+              maxSize: ${{github.event.inputs.nodes}}
+              minSize: 1
+              iam:
+                attachPolicy:
+                  Version: 2012-10-17
+                  Statement:
+                    - Effect: Allow
+                      Action:
+                        - "s3:*"
+                      Resource: "*"
+          EOF
+          eksctl create cluster -f eks.yaml
+
+      - name: Upload ClusterConfig file as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: EKS Cluster configuration
+          path: eks.yaml
+
+      - name: Create Kubernetes resources
+        run: |
+          kubectl create namespace ${{ env.NAMESPACE_ENV }}
+          kubectl config set-context --current --namespace=${{ env.NAMESPACE_ENV }}
+          kubectl create secret generic $K8_SECRET_NAME --from-literal=api-key=${{ secrets.PREFECT_API_KEY }} --from-literal=api-url=${{secrets.PREFECT_API_URL}}
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: agent
+            namespace: ${{ env.NAMESPACE_ENV }}
+          spec:
+            selector:
+              matchLabels:
+                app: agent
+            replicas: 1
+            template:
+              metadata:
+                labels:
+                  app: agent
+              spec:
+                containers:
+                  - name: agent
+                    image: ${{github.event.inputs.image}}
+                    command: ["prefect", "agent", "start", "-q", "${{ env.NAMESPACE_ENV }}"]
+                    imagePullPolicy: "IfNotPresent"
+                    env:
+                      - name: PREFECT_API_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${{ env.K8_SECRET_NAME }}
+                            key: api-url
+                      - name: PREFECT_API_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${{ env.K8_SECRET_NAME }}
+                            key: api-key
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: agent
+            namespace: ${{ env.NAMESPACE_ENV }}
+          rules:
+            - apiGroups: [""]
+              resources: ["pods", "pods/log", "pods/status"]
+              verbs: ["get", "watch", "list"]
+            - apiGroups: ["batch"]
+              resources: ["jobs"]
+              verbs: [ "get", "list", "watch", "create", "update", "patch", "delete" ]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: agent
+            namespace: ${{ env.NAMESPACE_ENV }}
+          subjects:
+            - kind: ServiceAccount
+              name: default
+              namespace: ${{ env.NAMESPACE_ENV }}
+          roleRef:
+            kind: Role
+            name: agent
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+
+      - name: Summary
+        run: echo '### AWS EKS cluster with a Prefect agent successfully deployed! :rocket:' >> $GITHUB_STEP_SUMMARY
+      - name: Slack Notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
